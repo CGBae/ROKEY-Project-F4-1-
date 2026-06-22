@@ -1,0 +1,104 @@
+multi_robot_oiling.py 파일을 새로 작성해줘.
+
+기존 m0609_oiling_camera.py를 기반으로 하되, 로봇을 2대(m0609_A, m0609_B)로 확장한다. m0609_A는 기존 주유 로직을 그대로 재사용하고, m0609_B는 커버 열기/마개 제거/마개 복원/커버 닫기를 담당하는 신규 로직을 추가한다.
+
+로봇 구성:
+
+m0609_A (주유 로봇) - 기존 코드 그대로 재사용
+ROBOT_A_PRIM_PATH = "/World/m0609_A"
+ROBOT_A_BASE_WORLD = [0.0, 0.0, 1.0]
+ROBOT_A_BASE_EULER_DEG = [90.0, 0.0, 0.0]
+
+m0609_B (주유구 여는 로봇) - 신규 작성
+ROBOT_B_PRIM_PATH = "/World/m0609_B"
+ROBOT_B_BASE_WORLD = [0.91, 0.0, 1.0]
+ROBOT_B_BASE_EULER_DEG = [90.0, 0.0, 0.0]
+
+씬 오브젝트 위치:
+FUEL_DOOR_CENTER = [0.67315, -1.33891, 1.02293]
+FUEL_CAP_CENTER = [0.67281, -1.42088, 1.06441]
+FUEL_PORT_HOLE_CENTER = [0.68002, -1.64065, 1.00525]
+
+커버(fuel_door) 구조:
+차체에 Revolution Joint로 연결된 힌지 구조. 왼쪽에서 오른쪽으로 열린다. m0609_B의 EE로 커버 표면을 밀어서 Revolution Joint 각도를 변화시키는 방식으로 제어한다.
+초기 각도: 30도
+중간 경유: 80도
+완전 열림: 130도
+닫을 때: 130도 -> 80도 -> 30도 역순
+
+카메라:
+m0609_A와 m0609_B가 동일한 벽 부착형 카메라를 공유한다. 컬러 디텍터(multi_color_detector.py)가 발행하는 토픽을 구독한다.
+
+ROS2 토픽 구조:
+
+m0609_B 구독:
+/color_detector/pose (PoseStamped)
+/color_detector/target_locked (Bool)
+/robot_a/done (Bool) - A 주유 완료 신호
+
+m0609_B 발행:
+/color_detector/mode_switch (String) - 디텍터 모드 전환 명령
+/robot_b/done (Bool) - B 복귀 완료, A 시작 신호
+
+m0609_A 구독:
+/color_detector/pose (PoseStamped)
+/color_detector/target_locked (Bool)
+/robot_b/done (Bool)
+
+m0609_A 발행:
+/robot_a/done (Bool)
+
+전체 동작 11단계:
+
+B-1: /color_detector/mode_switch에 "yellow" 발행 -> 노란색 lock 대기 -> 커버 위치 확정
+
+B-2: 커버 열기. EE를 커버 30도 위치 앞으로 이동 -> 80도 위치(중간) -> 130도 위치 순서로 밀면서 이동. RMPFlow 위치 제어로 커버 표면을 밀어서 Revolution Joint 각도 변화 유도.
+
+B-3: EE를 중간 지점(80도) 위치로 복귀
+
+B-4: /color_detector/mode_switch에 "blue" 발행 -> 파란색 lock 대기 -> 마개 위치 확정
+
+B-5: 마개(fuel_cap) 위치로 EE 이동
+
+B-6: 그리퍼 닫기 -> joint_6을 매 스텝 일정 각도씩 -360도까지 회전시켜서 마개 풀기 (set_joint_positions로 직접 제어, RMPFlow 아님) -> EE를 삽입 반대 방향으로 이동해서 마개 빼기
+
+B-7: 그리퍼 닫은 채로 ROBOT_B 초기 위치 복귀 -> 복귀 완료 후 /robot_b/done: True 발행
+
+A-8: /robot_b/done 수신 -> /color_detector/mode_switch에 "green" 발행 -> green lock 완료 -> 기존 WAIT_LOCK -> RUN_SEQUENCE 로직으로 주유 실행 -> 주유 완료 후 /robot_a/done: True 발행
+
+B-9: /robot_a/done 수신 -> 초록색 위치(fuel_port_hole)로 EE 이동 -> joint_6을 +360도 회전으로 마개 끼우기 -> 그리퍼 열기
+
+B-10: 커버 닫기. 130도 -> 80도(중간) -> 30도 역순으로 EE 이동
+
+B-11: ROBOT_B 초기 위치 복귀 -> task_done = True -> 시뮬레이션 일시정지
+
+m0609_B 상태머신 (run_state_B):
+WAIT_YELLOW -> OPEN_COVER -> RETURN_MID -> WAIT_BLUE -> MOVE_TO_CAP -> GRIP_UNSCREW -> RETURN_HOME_WITH_CAP -> WAIT_ROBOT_A -> RESTORE_CAP -> CLOSE_COVER -> FINAL_HOME
+
+동기화 규칙:
+B가 RETURN_HOME_WITH_CAP 완료 후에만 /robot_b/done 발행
+A는 /robot_b/done 수신 후에만 동작 시작
+A가 복귀 완료 후에만 /robot_a/done 발행
+B는 /robot_a/done 수신 후에만 마개 복원 시작
+
+제어 파라미터:
+PHYSICS_DT = 1.0 / 60.0
+POSITION_TOLERANCE = 0.060
+MAX_STEPS_PER_STAGE = 1200
+DEFAULT_TARGET_SPEED = 0.060
+NEAR_TARGET_SPEED = 0.040
+INSERT_TARGET_SPEED = 0.020
+RETREAT_TARGET_SPEED = 0.050
+HOME_JOINT_SPEED_ALPHA = 0.012
+HOME_JOINT_TOLERANCE = 0.035
+COVER_START_DEG = 30.0
+COVER_MID_DEG = 80.0
+COVER_OPEN_DEG = 130.0
+CAP_JOINT6_UNSCREW_DEG = -360.0
+CAP_JOINT6_SCREW_DEG = 360.0
+
+기반 코드 (아래 두 파일을 참고해서 작성):
+
+[여기에 m0609_oiling_camera.py 전체 코드 붙여넣기]
+
+[여기에 fuel_port_detector.py 전체 코드 붙여넣기]

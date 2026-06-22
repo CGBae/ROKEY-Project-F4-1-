@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fuel_port_detector_node_v2.py
+multi_color_detector.py
 
-M0609 automatic fueling project - perception node v2.
+M0609 multi-robot oiling project - perception node.
+
+기존 fuel_port_detector_node.py(초록 단일 감지)를 기반으로,
+외부 모드 전환 명령(yellow/blue/green)에 따라 한 번에 한 색만 감지하도록 확장한 버전.
 
 Input:
-  /rgb          sensor_msgs/msg/Image      (confirmed: rgb8, 640x640)
-  /depth        sensor_msgs/msg/Image      (confirmed: 32FC1, meter, 640x640)
-  /camera_info  sensor_msgs/msg/CameraInfo
+  /rgb                          sensor_msgs/msg/Image      (rgb8)
+  /depth                        sensor_msgs/msg/Image      (32FC1, meter)
+  /camera_info                  sensor_msgs/msg/CameraInfo
+  /color_detector/mode_switch   std_msgs/msg/String        ("yellow" / "blue" / "green")
 
 Output:
-  /fuel_port/pose_camera_raw       geometry_msgs/msg/PoseStamped
-  /fuel_port/pose_camera_filtered  geometry_msgs/msg/PoseStamped
-  /fuel_port/pose_camera           geometry_msgs/msg/PoseStamped  (legacy compatibility)
-  /fuel_port/target_locked         std_msgs/msg/Bool
-  /fuel_port/debug_image           sensor_msgs/msg/Image
+  /color_detector/pose          geometry_msgs/msg/PoseStamped  (현재 모드 색상의 3D 위치)
+  /color_detector/target_locked std_msgs/msg/Bool
+  /color_detector/current_mode  std_msgs/msg/String
+  /color_detector/debug_image   sensor_msgs/msg/Image
 
-What changed from v1:
-  - raw pose and filtered pose are separated
-  - depth/area/edge checks are added
-  - pose is smoothed by a short moving buffer
-  - target lock is published after N stable frames
-  - pose publish rate is limited
+감지 순서와 역할 (모드 전환은 외부 상태머신이 명령한다):
+  yellow -> fuel_door (커버) 위치
+  blue   -> fuel_cap (마개) 위치
+  green  -> fuel_port_hole (주유구 입구) 위치
+
+모드가 바뀌면 이전 색의 표적 샘플을 즉시 버린다(reset_stability).
 """
 
 from __future__ import annotations
@@ -35,19 +38,22 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 from cv_bridge import CvBridge
 import message_filters
 
 
-class FuelPortDetectorNodeV2(Node):
+VALID_MODES = ("yellow", "blue", "green")
+
+
+class MultiColorDetectorNode(Node):
     def __init__(self) -> None:
-        super().__init__("fuel_port_detector_node_v2")
+        super().__init__("multi_color_detector_node")
 
         # -----------------------------
         # Topic parameters
@@ -55,45 +61,44 @@ class FuelPortDetectorNodeV2(Node):
         self.declare_parameter("rgb_topic", "/rgb")
         self.declare_parameter("depth_topic", "/depth")
         self.declare_parameter("camera_info_topic", "/camera_info")
-        self.declare_parameter("raw_pose_topic", "/fuel_port/pose_camera_raw")
-        self.declare_parameter("filtered_pose_topic", "/fuel_port/pose_camera_filtered")
-        self.declare_parameter("legacy_pose_topic", "/fuel_port/pose_camera")
-        self.declare_parameter("target_locked_topic", "/fuel_port/target_locked")
-        self.declare_parameter("debug_image_topic", "/fuel_port/debug_image")
+        self.declare_parameter("mode_switch_topic", "/color_detector/mode_switch")
+        self.declare_parameter("pose_topic", "/color_detector/pose")
+        self.declare_parameter("target_locked_topic", "/color_detector/target_locked")
+        self.declare_parameter("current_mode_topic", "/color_detector/current_mode")
+        self.declare_parameter("debug_image_topic", "/color_detector/debug_image")
+        self.declare_parameter("initial_mode", "yellow")
 
         # -----------------------------
-        # Detection / filtering parameters
+        # Detection / filtering parameters (fuel_port_detector.py와 동일)
         # -----------------------------
-        self.declare_parameter("min_area", 100.0)
-        self.declare_parameter("max_area", 50000.0)
+        self.declare_parameter("min_area", 800.0)
+        self.declare_parameter("max_area", 20000.0)
         self.declare_parameter("depth_window", 9)
         self.declare_parameter("min_depth_m", 0.25)
-        self.declare_parameter("max_depth_m", 3)
+        self.declare_parameter("max_depth_m", 1.20)
         self.declare_parameter("edge_margin_px", 30)
         self.declare_parameter("reject_edge_for_lock", False)
         self.declare_parameter("stable_buffer_size", 12)
         self.declare_parameter("required_stable_frames", 8)
         self.declare_parameter("stable_std_threshold_m", 0.025)
-        self.declare_parameter("publish_hz", 10.0)
+        self.declare_parameter("publish_hz", 5.0)
         self.declare_parameter("publish_debug", True)
 
-        # HSV red threshold. Red wraps around hue=0, so we use two ranges.
-        # self.declare_parameter("red_low1", [0, 80, 60])
-        # self.declare_parameter("red_high1", [12, 255, 255])
-        # self.declare_parameter("red_low2", [170, 80, 60])
-        # self.declare_parameter("red_high2", [180, 255, 255])
-
-        # 색 탐지 코드
-        self.declare_parameter("green_high", [90, 255, 255])
+        # HSV 파라미터 기본값 (prompt 지정값)
+        self.declare_parameter("yellow_low", [20, 100, 100])
+        self.declare_parameter("yellow_high", [35, 255, 255])
+        self.declare_parameter("blue_low", [100, 150, 50])
+        self.declare_parameter("blue_high", [130, 255, 255])
         self.declare_parameter("green_low", [35, 80, 60])
+        self.declare_parameter("green_high", [90, 255, 255])
 
         self.rgb_topic = self.get_parameter("rgb_topic").value
         self.depth_topic = self.get_parameter("depth_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
-        self.raw_pose_topic = self.get_parameter("raw_pose_topic").value
-        self.filtered_pose_topic = self.get_parameter("filtered_pose_topic").value
-        self.legacy_pose_topic = self.get_parameter("legacy_pose_topic").value
+        self.mode_switch_topic = self.get_parameter("mode_switch_topic").value
+        self.pose_topic = self.get_parameter("pose_topic").value
         self.target_locked_topic = self.get_parameter("target_locked_topic").value
+        self.current_mode_topic = self.get_parameter("current_mode_topic").value
         self.debug_image_topic = self.get_parameter("debug_image_topic").value
 
         self.min_area = float(self.get_parameter("min_area").value)
@@ -112,25 +117,42 @@ class FuelPortDetectorNodeV2(Node):
         self.publish_period_ns = int(1e9 / max(self.publish_hz, 0.1))
         self.publish_debug = bool(self.get_parameter("publish_debug").value)
 
-        # self.red_low1 = np.array(self.get_parameter("red_low1").value, dtype=np.uint8)
-        # self.red_high1 = np.array(self.get_parameter("red_high1").value, dtype=np.uint8)
-        # self.red_low2 = np.array(self.get_parameter("red_low2").value, dtype=np.uint8)
-        # self.red_high2 = np.array(self.get_parameter("red_high2").value, dtype=np.uint8)
+        self.hsv_ranges = {
+            "yellow": (
+                np.array(self.get_parameter("yellow_low").value, dtype=np.uint8),
+                np.array(self.get_parameter("yellow_high").value, dtype=np.uint8),
+            ),
+            "blue": (
+                np.array(self.get_parameter("blue_low").value, dtype=np.uint8),
+                np.array(self.get_parameter("blue_high").value, dtype=np.uint8),
+            ),
+            "green": (
+                np.array(self.get_parameter("green_low").value, dtype=np.uint8),
+                np.array(self.get_parameter("green_high").value, dtype=np.uint8),
+            ),
+        }
 
-        self.green_low = np.array(self.get_parameter("green_low").value, dtype=np.uint8)
-        self.green_high = np.array(self.get_parameter("green_high").value, dtype=np.uint8)
-        
+        initial_mode = str(self.get_parameter("initial_mode").value).strip().lower()
+        self.current_mode = initial_mode if initial_mode in VALID_MODES else "yellow"
+
         self.bridge = CvBridge()
         self.camera_info: Optional[CameraInfo] = None
         self.point_buffer: deque[np.ndarray] = deque(maxlen=self.stable_buffer_size)
         self.stable_count = 0
         self.last_publish_time_ns = 0
-        self.last_locked = False
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
+        )
+        # mode_switch/current_mode은 늦게 join하는 쪽(로봇 runner, 디텍터 자신)도
+        # 마지막 값을 즉시 받을 수 있어야 하므로 TRANSIENT_LOCAL로 latch 시킨다.
+        latched_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
         )
 
         self.camera_info_sub = self.create_subscription(
@@ -143,22 +165,51 @@ class FuelPortDetectorNodeV2(Node):
         )
         self.sync.registerCallback(self.image_callback)
 
-        self.raw_pose_pub = self.create_publisher(PoseStamped, self.raw_pose_topic, 10)
-        self.filtered_pose_pub = self.create_publisher(PoseStamped, self.filtered_pose_topic, 10)
-        # Legacy output: publish the filtered pose when locked, otherwise raw pose.
-        self.legacy_pose_pub = self.create_publisher(PoseStamped, self.legacy_pose_topic, 10)
+        self.mode_switch_sub = self.create_subscription(
+            String, self.mode_switch_topic, self.mode_switch_callback, latched_qos
+        )
+
+        self.pose_pub = self.create_publisher(PoseStamped, self.pose_topic, 10)
         self.lock_pub = self.create_publisher(Bool, self.target_locked_topic, 10)
+        self.mode_pub = self.create_publisher(String, self.current_mode_topic, latched_qos)
         self.debug_pub = self.create_publisher(Image, self.debug_image_topic, 10)
 
-        self.get_logger().info("FuelPortDetectorNodeV2 started")
-        self.get_logger().info(f"  rgb_topic              = {self.rgb_topic}")
-        self.get_logger().info(f"  depth_topic            = {self.depth_topic}")
-        self.get_logger().info(f"  camera_info_topic      = {self.camera_info_topic}")
-        self.get_logger().info(f"  raw_pose_topic         = {self.raw_pose_topic}")
-        self.get_logger().info(f"  filtered_pose_topic    = {self.filtered_pose_topic}")
-        self.get_logger().info(f"  target_locked_topic    = {self.target_locked_topic}")
-        self.get_logger().info(f"  publish_hz             = {self.publish_hz}")
+        self.publish_current_mode()
 
+        self.get_logger().info("MultiColorDetectorNode started")
+        self.get_logger().info(f"  rgb_topic           = {self.rgb_topic}")
+        self.get_logger().info(f"  depth_topic         = {self.depth_topic}")
+        self.get_logger().info(f"  camera_info_topic   = {self.camera_info_topic}")
+        self.get_logger().info(f"  mode_switch_topic   = {self.mode_switch_topic}")
+        self.get_logger().info(f"  pose_topic          = {self.pose_topic}")
+        self.get_logger().info(f"  initial_mode        = {self.current_mode}")
+        self.get_logger().info(f"  publish_hz          = {self.publish_hz}")
+
+    # ------------------------------------------------------------------
+    # 모드 전환
+    # ------------------------------------------------------------------
+    def mode_switch_callback(self, msg: String) -> None:
+        new_mode = str(msg.data).strip().lower()
+        if new_mode not in VALID_MODES:
+            self.get_logger().warn(f"알 수 없는 mode_switch 값 무시: '{msg.data}'")
+            return
+        if new_mode == self.current_mode:
+            return
+        self.get_logger().info(f"mode_switch: {self.current_mode} -> {new_mode}")
+        self.current_mode = new_mode
+        self.reset_stability()
+        self.publish_current_mode()
+
+    def publish_current_mode(self) -> None:
+        self.mode_pub.publish(String(data=self.current_mode))
+
+    def reset_stability(self) -> None:
+        self.point_buffer.clear()
+        self.stable_count = 0
+
+    # ------------------------------------------------------------------
+    # 메인 콜백
+    # ------------------------------------------------------------------
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
 
@@ -174,11 +225,10 @@ class FuelPortDetectorNodeV2(Node):
             self.get_logger().error(f"Image conversion failed: {exc}")
             return
 
-        detection = self.detect_green_target(rgb)
-        status = "NO GREEN TARGET"
+        mode = self.current_mode
+        detection = self.detect_color_target(rgb, mode)
+        status = f"NO {mode.upper()} TARGET"
         locked = False
-        raw_pose = None
-        filtered_pose = None
         debug_detection = None
 
         if detection is not None:
@@ -197,8 +247,6 @@ class FuelPortDetectorNodeV2(Node):
                     self.reset_stability()
                 else:
                     point_np = np.array(point, dtype=np.float64)
-                    raw_pose = self.make_pose(rgb_msg, point_np)
-                    self.raw_pose_pub.publish(raw_pose)
 
                     if self.reject_edge_for_lock and edge_hit:
                         self.reset_stability()
@@ -212,8 +260,6 @@ class FuelPortDetectorNodeV2(Node):
                             self.stable_count = 0
 
                         locked = self.stable_count >= 1
-                        filtered_pose = self.make_pose(rgb_msg, mean)
-
                         edge_txt = " EDGE" if edge_hit else ""
                         status = (
                             f"{edge_txt} raw=({point_np[0]:.3f},{point_np[1]:.3f},{point_np[2]:.3f}) "
@@ -223,35 +269,28 @@ class FuelPortDetectorNodeV2(Node):
                         now_ns = self.get_clock().now().nanoseconds
                         if now_ns - self.last_publish_time_ns >= self.publish_period_ns:
                             self.last_publish_time_ns = now_ns
-                            if locked:
-                                self.filtered_pose_pub.publish(filtered_pose)
-                                self.legacy_pose_pub.publish(filtered_pose)
-                            else:
-                                # Legacy pose stays available for debugging, but controller should use filtered + lock.
-                                self.legacy_pose_pub.publish(raw_pose)
+                            self.pose_pub.publish(self.make_pose(rgb_msg, mean))
                             self.lock_pub.publish(Bool(data=bool(locked)))
 
                         self.get_logger().info(
-                            f"fuel_port v2: pixel=({u},{v}) depth={z:.3f}m "
+                            f"{mode}: pixel=({u},{v}) depth={z:.3f}m "
                             f"area={area:.1f} locked={locked} {status}",
                             throttle_duration_sec=0.5,
                         )
         else:
             self.reset_stability()
 
-        # Publish unlocked state occasionally even when no target is visible.
         now_ns = self.get_clock().now().nanoseconds
         if now_ns - self.last_publish_time_ns >= self.publish_period_ns:
             self.last_publish_time_ns = now_ns
             self.lock_pub.publish(Bool(data=bool(locked)))
 
         if self.publish_debug:
-            self.publish_debug_image(rgb_msg, rgb, debug_detection, status, locked)
+            self.publish_debug_image(rgb_msg, rgb, debug_detection, f"[{mode}] {status}", locked)
 
-    def reset_stability(self) -> None:
-        self.point_buffer.clear()
-        self.stable_count = 0
-
+    # ------------------------------------------------------------------
+    # 보조 함수들 (fuel_port_detector_node.py와 동일)
+    # ------------------------------------------------------------------
     def filtered_point_stats(self) -> Tuple[np.ndarray, float]:
         if not self.point_buffer:
             return np.zeros(3, dtype=np.float64), float("inf")
@@ -295,9 +334,10 @@ class FuelPortDetectorNodeV2(Node):
             return depth.astype(np.float32) * 0.001
         return depth.astype(np.float32)
 
-    def detect_green_target(self, rgb: np.ndarray) -> Optional[Tuple[int, int, float, Tuple[int, int, int, int]]]:
+    def detect_color_target(self, rgb: np.ndarray, mode: str) -> Optional[Tuple[int, int, float, Tuple[int, int, int, int]]]:
+        low, high = self.hsv_ranges[mode]
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        mask = cv2.inRange(hsv, self.green_low, self.green_high)
+        mask = cv2.inRange(hsv, low, high)
 
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -391,7 +431,7 @@ class FuelPortDetectorNodeV2(Node):
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = FuelPortDetectorNodeV2()
+    node = MultiColorDetectorNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
