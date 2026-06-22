@@ -64,24 +64,28 @@ class FuelPortDetectorNodeV2(Node):
         # -----------------------------
         # Detection / filtering parameters
         # -----------------------------
-        self.declare_parameter("min_area", 800.0)
-        self.declare_parameter("max_area", 20000.0)
+        self.declare_parameter("min_area", 100.0)
+        self.declare_parameter("max_area", 50000.0)
         self.declare_parameter("depth_window", 9)
         self.declare_parameter("min_depth_m", 0.25)
-        self.declare_parameter("max_depth_m", 1.20)
+        self.declare_parameter("max_depth_m", 3)
         self.declare_parameter("edge_margin_px", 30)
         self.declare_parameter("reject_edge_for_lock", False)
         self.declare_parameter("stable_buffer_size", 12)
         self.declare_parameter("required_stable_frames", 8)
         self.declare_parameter("stable_std_threshold_m", 0.025)
-        self.declare_parameter("publish_hz", 5.0)
+        self.declare_parameter("publish_hz", 10.0)
         self.declare_parameter("publish_debug", True)
 
         # HSV red threshold. Red wraps around hue=0, so we use two ranges.
-        self.declare_parameter("red_low1", [0, 80, 60])
-        self.declare_parameter("red_high1", [12, 255, 255])
-        self.declare_parameter("red_low2", [170, 80, 60])
-        self.declare_parameter("red_high2", [180, 255, 255])
+        # self.declare_parameter("red_low1", [0, 80, 60])
+        # self.declare_parameter("red_high1", [12, 255, 255])
+        # self.declare_parameter("red_low2", [170, 80, 60])
+        # self.declare_parameter("red_high2", [180, 255, 255])
+
+        # 색 탐지 코드
+        self.declare_parameter("green_high", [90, 255, 255])
+        self.declare_parameter("green_low", [35, 80, 60])
 
         self.rgb_topic = self.get_parameter("rgb_topic").value
         self.depth_topic = self.get_parameter("depth_topic").value
@@ -108,11 +112,14 @@ class FuelPortDetectorNodeV2(Node):
         self.publish_period_ns = int(1e9 / max(self.publish_hz, 0.1))
         self.publish_debug = bool(self.get_parameter("publish_debug").value)
 
-        self.red_low1 = np.array(self.get_parameter("red_low1").value, dtype=np.uint8)
-        self.red_high1 = np.array(self.get_parameter("red_high1").value, dtype=np.uint8)
-        self.red_low2 = np.array(self.get_parameter("red_low2").value, dtype=np.uint8)
-        self.red_high2 = np.array(self.get_parameter("red_high2").value, dtype=np.uint8)
+        # self.red_low1 = np.array(self.get_parameter("red_low1").value, dtype=np.uint8)
+        # self.red_high1 = np.array(self.get_parameter("red_high1").value, dtype=np.uint8)
+        # self.red_low2 = np.array(self.get_parameter("red_low2").value, dtype=np.uint8)
+        # self.red_high2 = np.array(self.get_parameter("red_high2").value, dtype=np.uint8)
 
+        self.green_low = np.array(self.get_parameter("green_low").value, dtype=np.uint8)
+        self.green_high = np.array(self.get_parameter("green_high").value, dtype=np.uint8)
+        
         self.bridge = CvBridge()
         self.camera_info: Optional[CameraInfo] = None
         self.point_buffer: deque[np.ndarray] = deque(maxlen=self.stable_buffer_size)
@@ -167,8 +174,8 @@ class FuelPortDetectorNodeV2(Node):
             self.get_logger().error(f"Image conversion failed: {exc}")
             return
 
-        detection = self.detect_red_target(rgb)
-        status = "NO RED TARGET"
+        detection = self.detect_green_target(rgb)
+        status = "NO GREEN TARGET"
         locked = False
         raw_pose = None
         filtered_pose = None
@@ -288,11 +295,9 @@ class FuelPortDetectorNodeV2(Node):
             return depth.astype(np.float32) * 0.001
         return depth.astype(np.float32)
 
-    def detect_red_target(self, rgb: np.ndarray) -> Optional[Tuple[int, int, float, Tuple[int, int, int, int]]]:
+    def detect_green_target(self, rgb: np.ndarray) -> Optional[Tuple[int, int, float, Tuple[int, int, int, int]]]:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        mask1 = cv2.inRange(hsv, self.red_low1, self.red_high1)
-        mask2 = cv2.inRange(hsv, self.red_low2, self.red_high2)
-        mask = cv2.bitwise_or(mask1, mask2)
+        mask = cv2.inRange(hsv, self.green_low, self.green_high)
 
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
