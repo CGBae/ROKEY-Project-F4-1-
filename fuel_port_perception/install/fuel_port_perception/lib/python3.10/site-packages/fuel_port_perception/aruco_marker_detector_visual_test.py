@@ -66,8 +66,8 @@ def _make_detector_parameters():
       - OpenCV 4.7+ style: cv2.aruco.DetectorParameters()
       - legacy style:       cv2.aruco.DetectorParameters_create()
     """
-    if hasattr(cv2.aruco, "DetectorParameters"):
-        return cv2.aruco.DetectorParameters()
+    # if hasattr(cv2.aruco, "DetectorParameters"):
+    #     return cv2.aruco.DetectorParameters()
     if hasattr(cv2.aruco, "DetectorParameters_create"):
         return cv2.aruco.DetectorParameters_create()
     raise AttributeError(
@@ -108,7 +108,7 @@ class ArucoMarkerDetectorNode(Node):
         self.declare_parameter("aruco_dictionary", "DICT_4X4_50")
         self.declare_parameter("marker_id", 0)
         # create_aruco_marker_grid_in_isaac.py의 MARKER_PATTERN_SIZE_M와 반드시 같게 맞춘다.
-        self.declare_parameter("marker_size_m", 0.15)
+        self.declare_parameter("marker_size_m", 0.12)
 
         # marker coordinate convention used by OpenCV estimatePoseSingleMarkers:
         #   x: marker right, y: marker down, z: marker normal toward camera.
@@ -121,9 +121,9 @@ class ArucoMarkerDetectorNode(Node):
         self.declare_parameter("marker_to_hole_xyz", [0.244428, -1.054349, -1.510171])
 
         # 안정화/발행 파라미터
-        self.declare_parameter("required_stable_frames", 3)
+        self.declare_parameter("required_stable_frames", 1)
         self.declare_parameter("stable_buffer_size", 8)
-        self.declare_parameter("stable_std_threshold_m", 0.035)
+        self.declare_parameter("stable_std_threshold_m", 0.03)
         self.declare_parameter("publish_hz", 10.0)
         self.declare_parameter("publish_debug", True)
         self.declare_parameter("draw_axes", True)

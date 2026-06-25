@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'multi_detector = fuel_port_perception.multi_color_detector:main',
             'aruco_marker = fuel_port_perception.aruco_marker_detector_visual_test:main',
+            'aruco_marker_2 = fuel_port_perception.create_aruco_marker_grid_visual_test:main'
         ],
     },
 )

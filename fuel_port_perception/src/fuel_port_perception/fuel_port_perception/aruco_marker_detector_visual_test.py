@@ -41,7 +41,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge
 
@@ -100,6 +100,7 @@ class ArucoMarkerDetectorNode(Node):
         self.declare_parameter("target_locked_topic", "/color_detector/target_locked")
         self.declare_parameter("current_mode_topic", "/color_detector/current_mode")
         self.declare_parameter("debug_image_topic", "/color_detector/debug_image")
+        self.declare_parameter("direction_topic", "/color_detector/direction")
         self.declare_parameter("initial_mode", "blue")
 
         # -----------------------------
@@ -120,6 +121,12 @@ class ArucoMarkerDetectorNode(Node):
         self.declare_parameter("marker_to_cap_xyz",  [0.238197, -1.090520, -1.302334])
         self.declare_parameter("marker_to_hole_xyz", [0.244428, -1.054349, -1.510171])
 
+        # marker 좌표계에서 주유구 삽입 방향 벡터.
+        # OpenCV ArUco 기준 marker +Z는 카메라 쪽을 향하는 marker normal이다.
+        # 노즐을 차량/주유구 안쪽으로 넣는 방향은 보통 -Z_marker이므로 기본값을 [0, 0, -1]로 둔다.
+        # 만약 반대로 나가면 [0, 0, 1]로 바꾸면 된다.
+        self.declare_parameter("direction_axis_marker_xyz", [0.0, 0.0, -1.0])
+
         # 안정화/발행 파라미터
         self.declare_parameter("required_stable_frames", 3)
         self.declare_parameter("stable_buffer_size", 8)
@@ -135,6 +142,7 @@ class ArucoMarkerDetectorNode(Node):
         self.target_locked_topic = self.get_parameter("target_locked_topic").value
         self.current_mode_topic = self.get_parameter("current_mode_topic").value
         self.debug_image_topic = self.get_parameter("debug_image_topic").value
+        self.direction_topic = self.get_parameter("direction_topic").value
 
         initial_mode = str(self.get_parameter("initial_mode").value).strip().lower()
         self.current_mode = initial_mode if initial_mode in VALID_MODES else "blue"
@@ -149,6 +157,19 @@ class ArucoMarkerDetectorNode(Node):
             "blue":   np.array(self.get_parameter("marker_to_cap_xyz").value, dtype=np.float64),
             "green":  np.array(self.get_parameter("marker_to_hole_xyz").value, dtype=np.float64),
         }
+
+        self.direction_axis_marker = np.array(
+            self.get_parameter("direction_axis_marker_xyz").value,
+            dtype=np.float64,
+        ).reshape(3)
+        axis_norm = float(np.linalg.norm(self.direction_axis_marker))
+        if axis_norm < 1e-9:
+            self.get_logger().warn(
+                "direction_axis_marker_xyz가 0 벡터입니다. 기본 삽입 방향 [0, 0, -1]을 사용합니다."
+            )
+            self.direction_axis_marker = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        else:
+            self.direction_axis_marker = self.direction_axis_marker / axis_norm
 
         self.required_stable_frames = int(self.get_parameter("required_stable_frames").value)
         self.stable_buffer_size = int(self.get_parameter("stable_buffer_size").value)
@@ -193,6 +214,7 @@ class ArucoMarkerDetectorNode(Node):
         self.lock_pub = self.create_publisher(Bool, self.target_locked_topic, 10)
         self.mode_pub = self.create_publisher(String, self.current_mode_topic, latched_qos)
         self.debug_pub = self.create_publisher(Image, self.debug_image_topic, 10)
+        self.direction_pub = self.create_publisher(Vector3Stamped, self.direction_topic, 10)
 
         self.publish_current_mode()
         self.get_logger().info("ArucoMarkerDetectorNode started")
@@ -200,10 +222,12 @@ class ArucoMarkerDetectorNode(Node):
         self.get_logger().info(f"  camera_info_topic   = {self.camera_info_topic}")
         self.get_logger().info(f"  mode_switch_topic   = {self.mode_switch_topic}")
         self.get_logger().info(f"  pose_topic          = {self.pose_topic}")
+        self.get_logger().info(f"  direction_topic     = {self.direction_topic}")
         self.get_logger().info(f"  dictionary          = {self.dictionary_name}")
         self.get_logger().info(f"  marker_id           = {self.marker_id}")
         self.get_logger().info(f"  marker_size_m       = {self.marker_size_m:.3f}")
         self.get_logger().info(f"  initial_mode        = {self.current_mode}")
+        self.get_logger().info(f"  direction_axis_marker_xyz = {np.round(self.direction_axis_marker, 4).tolist()}")
         for mode, offset in self.target_offsets.items():
             self.get_logger().info(f"  marker_to_{mode}_xyz = {np.round(offset, 4).tolist()}")
 
@@ -251,6 +275,7 @@ class ArucoMarkerDetectorNode(Node):
         detection = self.detect_marker_pose(rgb, camera_matrix, dist_coeffs)
         locked = False
         target_camera = None
+        direction_camera = None
         status = "NO ARUCO MARKER"
         debug_payload = None
 
@@ -259,6 +284,7 @@ class ArucoMarkerDetectorNode(Node):
             offset_marker = self.target_offsets[self.current_mode].reshape(3, 1)
             R_marker_to_camera, _ = cv2.Rodrigues(rvec.reshape(3, 1))
             target_camera = (R_marker_to_camera @ offset_marker + tvec.reshape(3, 1)).reshape(3)
+            direction_camera = self.compute_direction_camera(R_marker_to_camera)
 
             self.point_buffer.append(target_camera.astype(np.float64))
             mean, std_norm = self.filtered_point_stats()
@@ -270,14 +296,16 @@ class ArucoMarkerDetectorNode(Node):
             status = (
                 f"id={self.marker_id} mode={self.current_mode} "
                 f"target=({target_camera[0]:.3f},{target_camera[1]:.3f},{target_camera[2]:.3f}) "
+                f"dir=({direction_camera[0]:.3f},{direction_camera[1]:.3f},{direction_camera[2]:.3f}) "
                 f"std={std_norm:.3f} stable={self.stable_count}/{self.required_stable_frames}"
             )
-            debug_payload = (corners, rvec, tvec, mean, target_camera)
+            debug_payload = (corners, rvec, tvec, mean, target_camera, direction_camera)
 
             now_ns = self.get_clock().now().nanoseconds
             if now_ns - self.last_publish_time_ns >= self.publish_period_ns:
                 self.last_publish_time_ns = now_ns
-                self.pose_pub.publish(self.make_pose(rgb_msg, mean))
+                self.pose_pub.publish(self.make_pose(rgb_msg, mean, R_marker_to_camera))
+                self.direction_pub.publish(self.make_direction(rgb_msg, direction_camera))
                 self.lock_pub.publish(Bool(data=bool(locked)))
 
             self.get_logger().info(status + f" locked={locked}", throttle_duration_sec=0.5)
@@ -339,18 +367,82 @@ class ArucoMarkerDetectorNode(Node):
         d = np.array(info.d, dtype=np.float64).reshape(-1, 1) if info.d else np.zeros((5, 1), dtype=np.float64)
         return k, d
 
-    def make_pose(self, image_msg: Image, point_camera: np.ndarray) -> PoseStamped:
+    def make_pose(self, image_msg: Image, point_camera: np.ndarray,
+                  R_marker_to_camera: Optional[np.ndarray] = None) -> PoseStamped:
         pose = PoseStamped()
         pose.header.stamp = image_msg.header.stamp
         pose.header.frame_id = self.camera_info.header.frame_id or image_msg.header.frame_id or "sim_camera"
         pose.pose.position.x = float(point_camera[0])
         pose.pose.position.y = float(point_camera[1])
         pose.pose.position.z = float(point_camera[2])
-        pose.pose.orientation.x = 0.0
-        pose.pose.orientation.y = 0.0
-        pose.pose.orientation.z = 0.0
-        pose.pose.orientation.w = 1.0
+
+        # 기존에는 orientation을 identity로 고정했지만, 이제는 ArUco marker의 자세를 담는다.
+        # 이 quaternion은 camera optical frame 기준 marker frame의 회전이다.
+        if R_marker_to_camera is not None:
+            qx, qy, qz, qw = self.rotation_matrix_to_quaternion(R_marker_to_camera)
+            pose.pose.orientation.x = float(qx)
+            pose.pose.orientation.y = float(qy)
+            pose.pose.orientation.z = float(qz)
+            pose.pose.orientation.w = float(qw)
+        else:
+            pose.pose.orientation.x = 0.0
+            pose.pose.orientation.y = 0.0
+            pose.pose.orientation.z = 0.0
+            pose.pose.orientation.w = 1.0
         return pose
+
+    def make_direction(self, image_msg: Image, direction_camera: np.ndarray) -> Vector3Stamped:
+        msg = Vector3Stamped()
+        msg.header.stamp = image_msg.header.stamp
+        msg.header.frame_id = self.camera_info.header.frame_id or image_msg.header.frame_id or "sim_camera"
+        msg.vector.x = float(direction_camera[0])
+        msg.vector.y = float(direction_camera[1])
+        msg.vector.z = float(direction_camera[2])
+        return msg
+
+    def compute_direction_camera(self, R_marker_to_camera: np.ndarray) -> np.ndarray:
+        direction = R_marker_to_camera @ self.direction_axis_marker.reshape(3)
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-9:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return direction / norm
+
+    @staticmethod
+    def rotation_matrix_to_quaternion(R: np.ndarray) -> Tuple[float, float, float, float]:
+        """3x3 rotation matrix를 ROS quaternion(x, y, z, w)으로 변환한다."""
+        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        trace = float(np.trace(R))
+        if trace > 0.0:
+            s = np.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (R[2, 1] - R[1, 2]) / s
+            qy = (R[0, 2] - R[2, 0]) / s
+            qz = (R[1, 0] - R[0, 1]) / s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+            qw = (R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s
+            qz = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+            qw = (R[0, 2] - R[2, 0]) / s
+            qx = (R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+            qw = (R[1, 0] - R[0, 1]) / s
+            qx = (R[0, 2] + R[2, 0]) / s
+            qy = (R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+
+        q = np.array([qx, qy, qz, qw], dtype=np.float64)
+        q_norm = float(np.linalg.norm(q))
+        if q_norm < 1e-9:
+            return 0.0, 0.0, 0.0, 1.0
+        q /= q_norm
+        return float(q[0]), float(q[1]), float(q[2]), float(q[3])
 
     # ------------------------------------------------------------------
     # Image conversion / debug
@@ -375,7 +467,7 @@ class ArucoMarkerDetectorNode(Node):
         debug = rgb.copy()
         color = (0, 255, 0) if locked else (255, 180, 0)
         if payload is not None:
-            corners, rvec, tvec, mean, target_camera = payload
+            corners, rvec, tvec, mean, target_camera, direction_camera = payload
             cv2.aruco.drawDetectedMarkers(debug, [corners], np.array([[self.marker_id]], dtype=np.int32), color)
             if self.draw_axes:
                 try:
@@ -395,6 +487,36 @@ class ArucoMarkerDetectorNode(Node):
                 u, v = projected.reshape(2)
                 cv2.circle(debug, (int(round(u)), int(round(v))), 7, (255, 255, 255), -1)
                 cv2.circle(debug, (int(round(u)), int(round(v))), 9, color, 2)
+
+                # 방향 벡터를 이미지에 화살표로 표시한다.
+                arrow_len_m = max(self.marker_size_m * 0.7, 0.05)
+                p0 = mean.reshape(1, 1, 3).astype(np.float64)
+                p1 = (mean + direction_camera * arrow_len_m).reshape(1, 1, 3).astype(np.float64)
+                proj0, _ = cv2.projectPoints(
+                    p0,
+                    np.zeros((3, 1), dtype=np.float64),
+                    np.zeros((3, 1), dtype=np.float64),
+                    camera_matrix,
+                    dist_coeffs,
+                )
+                proj1, _ = cv2.projectPoints(
+                    p1,
+                    np.zeros((3, 1), dtype=np.float64),
+                    np.zeros((3, 1), dtype=np.float64),
+                    camera_matrix,
+                    dist_coeffs,
+                )
+                u0, v0 = proj0.reshape(2)
+                u1, v1 = proj1.reshape(2)
+                cv2.arrowedLine(
+                    debug,
+                    (int(round(u0)), int(round(v0))),
+                    (int(round(u1)), int(round(v1))),
+                    color,
+                    3,
+                    cv2.LINE_AA,
+                    tipLength=0.25,
+                )
             except Exception:
                 pass
             cv2.putText(debug, f"ARUCO LOCK={locked} mode={self.current_mode}", (20, 30),
