@@ -561,6 +561,34 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 }
 @keyframes fadein { from { opacity:0; transform:translateY(4px); } to { opacity:1; } }
 
+/* ── SSE 디버그 패널 ─────────────────────────────────────────────────────── */
+.sse-debug-panel {
+  width: 100%;
+  background: #0a0a0a;
+  border: 1px solid #333;
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-family: monospace;
+  font-size: 10px;
+  color: #666;
+}
+.sse-debug-panel summary {
+  cursor: pointer;
+  color: #555;
+  font-size: 11px;
+  padding: 2px 0;
+  user-select: none;
+}
+.sse-debug-panel summary:hover { color: #888; }
+#sse-raw-log {
+  margin-top: 6px;
+  white-space: pre;
+  overflow-x: auto;
+  max-height: 110px;
+  overflow-y: auto;
+  line-height: 1.4;
+  color: #4a9;
+}
 /* ── 경고 배너 ───────────────────────────────────────────────────────────── */
 .warn-banner {
   width: 100%;
@@ -963,6 +991,12 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
       <span class="log-msg" id="log-msg">서버 연결 대기 중...</span>
     </div>
 
+    <!-- SSE 수신 디버그 패널 (개발/진단용) -->
+    <details class="sse-debug-panel">
+      <summary>📡 SSE 수신 로그 (진단용)</summary>
+      <div id="sse-raw-log">메시지 대기 중...</div>
+    </details>
+
     <!-- 경고 배너 -->
     <div class="warn-banner" id="warn-banner">
       <span class="warn-icon">⚠️</span>
@@ -1045,10 +1079,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 /* ════════════════════════════════════════════════════════════════════════════
    상수 및 상태
    ════════════════════════════════════════════════════════════════════════════ */
-// 주유 속도: 금액에 따라 동적으로 계산됨 (readSettings 참조)
-// 공식: 채우는 시간(초) = 1 + 금액(원) / 5000
-// → 1만원=3초, 2만원=5초, 3만원=7초 ...
-const LITER_PER_TICK_DEFAULT = 0.05; // 목표 미입력 시 폴백
+const LITER_PER_TICK_DEFAULT = 0.05; // 목표 미입력 시 폴백 (0.5 L/s)
 
 const state = {
   connected:     false,
@@ -1058,12 +1089,17 @@ const state = {
   liters:        0,
   timerHandle:   null,
   literHandle:   null,
+  fuelDoneTimer: null,   // 목표 달성 후 자동 영수증 폴백 타이머
   // 설정값
   pricePerLiter: 2000,
   targetLiters:  0,
+  targetKrw:     0,      // 입력한 목표 금액 (원) — 영수증에 그대로 표시
   literPerTick:  LITER_PER_TICK_DEFAULT,
-  fuelMode:      'krw',   // 'krw' | 'liter'
-  stopped:       false,   // 사용자가 정지 버튼을 눌렀는지
+  fuelMode:      'krw',
+  stopped:       false,
+  // 흐름 제어
+  started:       false,  // 주유 시작 버튼을 눌렀는지 (SSE 히스토리 리플레이 방지)
+  receiptShown:  false,  // 영수증 이미 표시됐는지 (중복 방지)
 };
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1073,7 +1109,7 @@ const state = {
 // step: 활성화할 단계 인덱스 (0~4), null 이면 단계 변경 없음
 const PATTERNS = [
   { re: /\[차량\].*주유소 입고 시작/,         step: null, msg: '차량이 입고 중입니다...' },
-  { re: /\[차량\].*주차 완료/,               step: 0,    msg: '차량 주차 완료. 주유 준비를 시작합니다.' },
+  { re: /\[차량\].*주차 완료/,               step: 1,    msg: '차량 주차 완료. 주유구 덮개를 열고 있습니다.' },
   { re: /\[B\].*덮개 자동 열림 시작/,        step: 1,    msg: '주유구 덮개를 여는 중입니다...' },
   { re: /\[B\].*덮개 위치 확인 완료/,        step: 1,    msg: '덮개 열림 확인 완료.' },
   { re: /\[B\].*마개 위치 인식 시작/,        step: 1,    msg: '마개 위치를 확인하는 중입니다...' },
@@ -1081,9 +1117,10 @@ const PATTERNS = [
   { re: /\[B\].*마개 분리 시작/,             step: 2,    msg: '마개를 분리하는 중입니다...' },
   { re: /\[B\].*마개 추출 완료/,             step: 2,    msg: '마개 분리 완료. 주유를 시작합니다.' },
   { re: /\[A\].*주유구 위치 확인 완료/,      step: 3,    msg: '주유구 위치 확인. 노즐을 삽입합니다...' },
-  { re: /\[A\].*주유구 접근 시작/,           step: 3,    msg: '노즐이 주유구로 접근 중입니다...' },
-  { re: /\[A\].*노즐 삽입 완료/,             step: 3,    msg: '노즐 삽입 완료. 주유 중입니다.', startFueling: true },
-  { re: /\[A\].*주유 완료/,                  step: 3,    msg: '주유 완료! 노즐을 회수합니다.', stopLiters: true },
+  { re: /A.*주유구 접근 시작/,               step: 3,    msg: '노즐이 주유구로 접근 중입니다...' },
+  { re: /A.*삽입 준비/,                      step: 3,    msg: '노즐 삽입 위치 도착. 주유를 시작합니다.', startFueling: true },
+  { re: /A.*노즐 삽입 완료/,                 step: 3,    msg: '주유 진행 중입니다...' },
+  { re: /A.*주유 완료.*노즐/,                step: 3,    msg: '주유 완료! 노즐을 회수합니다.', stopLiters: true },
   { re: /\[B\].*마개 재장착 완료/,           step: 4,    msg: '마개 재장착 완료. 마무리 중입니다.' },
   { re: /\[B\].*덮개 닫힘 완료/,             step: 4,    msg: '덮개 닫힘 완료.' },
   { re: /\[B\].*초기 위치 복귀 완료/,        step: 4,    msg: '로봇 복귀 완료.' },
@@ -1131,7 +1168,6 @@ function startElapsedTimer() {
 function startLiterCounter() {
   if (state.fuelingActive || state.literHandle) return;
   state.fuelingActive = true;
-  // 정지 버튼 표시
   document.getElementById('stop-btn').classList.add('visible');
   state.literHandle = setInterval(() => {
     if (!state.fuelingActive) return;
@@ -1142,8 +1178,10 @@ function startLiterCounter() {
       state.liters = state.targetLiters;
       state.fuelingActive = false;
       clearInterval(state.literHandle);
-      const krw = Math.round(state.liters * state.pricePerLiter).toLocaleString('ko-KR');
-      setLog('✅', `목표 주유량 도달 (${state.liters.toFixed(1)} L / ${krw}원). 노즐을 회수합니다.`);
+      const krwStr = (state.targetKrw > 0 ? state.targetKrw : Math.round(state.liters * state.pricePerLiter)).toLocaleString('ko-KR');
+      setLog('✅', `목표 주유량 도달 (${state.liters.toFixed(1)} L / ${krwStr}원). 로봇 마무리 중...`);
+      // 폴백: 120초 후에도 [완료] SSE 가 안 오면 영수증 자동 표시
+      state.fuelDoneTimer = setTimeout(() => showReceipt(), 120000);
     }
 
     updateMetrics();
@@ -1155,6 +1193,7 @@ function stopCounters() {
   state.done = true;
   clearInterval(state.timerHandle);
   clearInterval(state.literHandle);
+  if (state.fuelDoneTimer) { clearTimeout(state.fuelDoneTimer); state.fuelDoneTimer = null; }
   document.getElementById('stop-btn').classList.remove('visible');
 }
 
@@ -1264,6 +1303,9 @@ async function confirmStop() {
 
   const krw = Math.round(state.liters * state.pricePerLiter).toLocaleString('ko-KR');
   setLog('🛑', `주유 정지 — ${state.liters.toFixed(1)} L / ${krw}원으로 정산됩니다. 로봇이 마무리 중입니다...`);
+  // 중도 정지 시 targetKrw 를 실제 누적 금액으로 재설정 (영수증 표시용)
+  state.targetKrw    = Math.round(state.liters * state.pricePerLiter);
+  state.targetLiters = state.liters;
 
   // 서버에 정지 신호 → Isaac Sim /stop_fueling 토픽 발행
   try {
@@ -1342,21 +1384,37 @@ function readSettings() {
   const mode = state.fuelMode;
 
   if (raw <= 0) {
-    state.targetLiters  = 0;
-    state.literPerTick  = LITER_PER_TICK_DEFAULT;
+    state.targetLiters = 0;
+    state.targetKrw    = 0;
+    state.literPerTick = LITER_PER_TICK_DEFAULT;
     return;
   }
 
   if (mode === 'krw') {
+    state.targetKrw    = raw;
     state.targetLiters = raw / state.pricePerLiter;
     const secs = calcFillSeconds(raw);
-    state.literPerTick = state.targetLiters / (secs * 10); // 10 ticks/s
+    state.literPerTick = state.targetLiters / (secs * 10);
   } else {
     state.targetLiters = raw;
-    const krwEquiv = raw * state.pricePerLiter;
-    const secs = calcFillSeconds(krwEquiv);
+    state.targetKrw    = raw * state.pricePerLiter;
+    const secs = calcFillSeconds(raw * state.pricePerLiter);
     state.literPerTick = state.targetLiters / (secs * 10);
   }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   SSE 디버그 패널
+   ════════════════════════════════════════════════════════════════════════════ */
+const _sseRawLines = [];
+function _updateSseDebug(line) {
+  // 한국어 포함 또는 핵심 태그가 있는 라인만 표시 (Isaac 내부 영어 노이즈 필터)
+  const _KEY = /[가-힣]|\[차량\]|\[A\]|\[B\]|\[완료\]|\[웹UI\]|\[RESET\]|\[LOOP\]|✅|mode_switch/;
+  if (!_KEY.test(line)) return;
+  _sseRawLines.push(line.slice(0, 140));   // 너무 긴 줄 잘라내기
+  if (_sseRawLines.length > 15) _sseRawLines.shift();
+  const el = document.getElementById('sse-raw-log');
+  if (el) el.textContent = _sseRawLines.slice().reverse().join('\n');
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1364,13 +1422,14 @@ function readSettings() {
    ════════════════════════════════════════════════════════════════════════════ */
 function processLine(line) {
   if (!line || line === '__connected__') return;
+  _updateSseDebug(line);
 
-  // 경고 체크 (주유 흐름은 계속)
+  // 주유 시작 버튼을 누른 이후에만 처리 (SSE 히스토리 리플레이 방지)
+  if (!state.started) return;
+
+  // 경고 체크
   for (const { re, msg } of WARN_PATTERNS) {
-    if (re.test(line)) {
-      showWarn(msg);
-      break;
-    }
+    if (re.test(line)) { showWarn(msg); break; }
   }
 
   // 주요 패턴 체크
@@ -1380,33 +1439,33 @@ function processLine(line) {
     if (p.step !== null) activateStep(p.step);
     if (p.msg)           setLog('🔧', p.msg);
 
+    // startFueling: 주유건 삽입 시점 — 연료 게이지 시뮬레이션 시작
     if (p.startFueling) {
       startLiterCounter();
       setLog('⛽', p.msg);
     }
 
-    // 리터 카운터만 정지 (타이머/SSE는 계속 — B가 마무리 중)
+    // stopLiters: 리터 카운터 정지 (타이머/SSE는 계속)
     if (p.stopLiters && state.fuelingActive) {
       state.fuelingActive = false;
       clearInterval(state.literHandle);
-      const krw = Math.round(state.liters * state.pricePerLiter).toLocaleString('ko-KR');
-      setLog('⛽', `주유 완료 — ${state.liters.toFixed(1)} L / ${krw}원. 마무리 중입니다...`);
+      const krwStr = (state.targetKrw > 0 ? state.targetKrw : Math.round(state.liters * state.pricePerLiter)).toLocaleString('ko-KR');
+      setLog('⛽', `주유 완료 — ${state.liters.toFixed(1)} L / ${krwStr}원. 마무리 중입니다...`);
     }
 
+    // complete: 모든 단계 완료 → 즉시 영수증
     if (p.complete) {
       setLog('✅', p.msg);
       stopCounters();
-      // 단계 전부 완료로 표시
       for (let i = 0; i <= 4; i++) {
         const el = document.getElementById(`step-${i}`);
         el.classList.remove('active');
         el.classList.add('done');
       }
-      // 1.2초 후 영수증으로 전환
-      setTimeout(showReceipt, 1200);
+      showReceipt();
     }
 
-    return; // 첫 번째 매칭만 처리
+    return;
   }
 }
 
@@ -1422,14 +1481,17 @@ async function handleStart() {
   initGauge();
   document.getElementById('settings-panel').classList.add('locked');
 
-  // 타이머 시작
+  // 시작 상태 설정 (이후 SSE 이벤트 처리 허용)
+  state.started = true;
+
+  // 경과 타이머만 즉시 시작 (연료 게이지는 주유건 삽입 시 SSE로 시작)
   startElapsedTimer();
   activateStep(0);
 
-  const targetMsg = state.targetLiters > 0
-    ? ` (목표: ${state.targetLiters.toFixed(1)}L / ${Math.round(state.targetLiters * state.pricePerLiter).toLocaleString('ko-KR')}원)`
-    : ' (만충)';
-  setLog('🚗', `주유 시작 명령을 전송하는 중...${targetMsg}`);
+  const krwStr = state.targetKrw > 0
+    ? `${state.targetLiters.toFixed(1)}L / ${Math.round(state.targetKrw).toLocaleString('ko-KR')}원`
+    : '만충';
+  setLog('🚗', `주유 시작 명령을 전송하는 중... (목표: ${krwStr})`);
 
   try {
     const res = await fetch('/start', {
@@ -1452,6 +1514,12 @@ async function handleStart() {
    영수증 전환
    ════════════════════════════════════════════════════════════════════════════ */
 function showReceipt() {
+  if (state.receiptShown) return;   // 중복 표시 방지
+  state.receiptShown = true;
+
+  // 남아있는 카운터 모두 정지
+  stopCounters();
+
   const now = new Date();
   const dateStr = now.toLocaleDateString('ko-KR', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'short'
@@ -1462,9 +1530,18 @@ function showReceipt() {
 
   document.getElementById('receipt-dt').innerHTML = `${dateStr}<br>${timeStr}`;
   document.getElementById('r-price').textContent  = state.pricePerLiter.toLocaleString('ko-KR') + ' 원/L';
-  document.getElementById('r-liters').textContent = fmtLiters(state.liters);
-  document.getElementById('r-amount').textContent = fmtKRW(state.liters);
 
+  // 주유량: 입력한 목표값 우선, 없으면 시뮬레이션 누적값
+  const displayLiters = state.targetLiters > 0 ? state.targetLiters : state.liters;
+  document.getElementById('r-liters').textContent = fmtLiters(displayLiters);
+
+  // 금액: 입력한 금액 그대로 우선, 없으면 누적 리터 계산
+  const displayKrw = state.targetKrw > 0
+    ? state.targetKrw.toLocaleString('ko-KR') + ' 원'
+    : fmtKRW(state.liters);
+  document.getElementById('r-amount').textContent = displayKrw;
+
+  // 소요 시간 (경과 타이머)
   const m = String(Math.floor(state.elapsedSec / 60)).padStart(2, '0');
   const s = String(state.elapsedSec % 60).padStart(2, '0');
   document.getElementById('r-time').textContent = `${m}분 ${s}초`;

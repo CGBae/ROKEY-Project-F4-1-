@@ -17,6 +17,7 @@ POST /start 로 /start_fueling ROS2 토픽을 발행합니다.
 import asyncio
 import sys
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import List
 
@@ -63,12 +64,14 @@ except ImportError:
 # ── SSE 브로드캐스트 ────────────────────────────────────────────────────────
 _clients: List[asyncio.Queue] = []
 _event_loop: asyncio.AbstractEventLoop | None = None
+_msg_history: deque = deque(maxlen=200)  # 새 브라우저 연결 시 최근 메시지 재전송용
 
 
 def _broadcast(line: str) -> None:
     """stdin 읽기 스레드에서 호출 → 모든 SSE 클라이언트 큐에 라인 전달."""
     if _event_loop is None:
         return
+    _msg_history.append(line)
     for q in list(_clients):
         _event_loop.call_soon_threadsafe(q.put_nowait, line)
 
@@ -136,6 +139,10 @@ async def events():
     async def _stream():
         try:
             yield "data: __connected__\n\n"   # 초기 핸드셰이크
+            # 브라우저가 늦게 연결된 경우를 위해 최근 메시지 이력을 재전송
+            for hist_line in list(_msg_history):
+                yield f"data: {hist_line}\n\n"
+            # 이후 실시간 스트림
             while True:
                 line = await q.get()
                 yield f"data: {line}\n\n"
@@ -158,7 +165,11 @@ async def events():
 
 @app.post("/start")
 async def start_fueling(request: Request):
-    """목표 주유량을 /fuel_target 으로 먼저 발행한 뒤 /start_fueling 으로 Play 트리거."""
+    """목표 주유량을 받아 파일 트리거로 Isaac Sim 에 전달한다.
+    uvicorn 프로세스는 ROS2 환경이 소싱되지 않을 수 있으므로
+    /tmp/autofuel_start 파일을 생성하는 방식으로 신호를 전달한다.
+    Isaac Sim 루프가 이 파일을 발견하면 주유 시퀀스를 시작한다."""
+    import pathlib
     body = {}
     try:
         body = await request.json()
@@ -166,11 +177,15 @@ async def start_fueling(request: Request):
         pass
     target_liters = float(body.get("target_liters", 0.0))
 
+    # 파일에 목표 주유량 기록 → Isaac Sim 루프가 읽고 삭제
+    pathlib.Path("/tmp/autofuel_start").write_text(str(target_liters))
+
     if _ros_available and _ros_node:
-        _ros_node.set_target(target_liters)   # 먼저 목표량 전송
-        _ros_node.trigger()                   # 그다음 시작 신호
+        _ros_node.set_target(target_liters)
+        _ros_node.trigger()
         return {"status": "ok", "ros": True, "target_liters": target_liters}
-    return {"status": "ok", "ros": False, "note": "rclpy 미설치 — ROS 발행 건너뜀"}
+    return {"status": "ok", "ros": False, "target_liters": target_liters,
+            "note": "파일 트리거(/tmp/autofuel_start) 사용"}
 
 
 @app.post("/stop")
