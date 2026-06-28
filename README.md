@@ -20,7 +20,7 @@ Isaac Sim과 ROS2를 기반으로 한 **자동 주유 로봇 팔 시뮬레이션
 
 ### 1.1 시스템 구성도
 
-<img width="1672" height="941" alt="ChatGPT Image Jun 24, 2026, 04_08_23 PM" src="https://github.com/user-attachments/assets/5e62505f-42bc-490c-9c4e-04dbc16eae46" />
+<img width="1672" height="941" alt="ChatGPT Image Jun 27, 2026, 03_44_09 PM" src="https://github.com/user-attachments/assets/cbaf5ba9-5fca-49fe-8bff-9b50db98ac92" />
 
 
 ### 1.2 주요 모듈 역할
@@ -40,7 +40,8 @@ Isaac Sim과 ROS2를 기반으로 한 **자동 주유 로봇 팔 시뮬레이션
 
 ### 1.3 전체 동작 플로우
 
-<img width="2720" height="3440" alt="fueling_flowchart_v4" src="https://github.com/user-attachments/assets/b00b98ae-1d8a-45e4-8955-00fdb80380c1" />
+<img width="1672" height="941" alt="ChatGPT Image Jun 26, 2026, 07_53_40 PM" src="https://github.com/user-attachments/assets/f0afed26-94fc-45ab-95da-c582af72bc85" />
+
 
 
 ---
