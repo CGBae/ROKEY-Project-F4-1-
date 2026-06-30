@@ -311,7 +311,7 @@ ros2 run fuel_port_perception aruco_marker_detector \
 
 ### 5.5 Isaac Sim 환경 설정
 
-새 터미널을 열고 ROS2 환경을 source 합니다.
+새 터미널을 Isaac sim 설정을 합니다.
 
 ```bash
 export ROS_DOMAIN_ID='도메인값'
