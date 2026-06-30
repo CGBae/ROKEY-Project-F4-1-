@@ -278,6 +278,11 @@ source ~/Desktop/rokey_F4/install/setup.bash
 
 ArUco 인식 노드를 먼저 실행합니다.
 
+파일 Desktop 기준 파일 이동
+```bash
+cd Desktop/rokey_F4/fuel_port_perception
+```
+
 ```bash
 ros2 run fuel_port_perception aruco_marker_detector \
   --ros-args \
