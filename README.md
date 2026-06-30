@@ -282,6 +282,11 @@ python3 aruco_marker_detector.py
 ros2 run <package_name> aruco_marker_detector
 ```
 
+yaml 파일 적용한 경우
+```bash
+ros2 run fuel_port_perception aruco_marker_detector --ros-args --params-file ~/Desktop/rokey_F4/fuel_port_perception/src/fuel_port_perception/config/aruco_detector_params_visual_test.yaml
+```
+
 실행 후 다음 토픽을 구독합니다.
 
 | Subscribe Topic               | Message Type                 | 설명                    |
@@ -310,7 +315,7 @@ Isaac Sim Python 환경에서 메인 스크립트를 실행합니다.
 ```bash
 cd automatic-oiling-robot
 
-~/.local/share/ov/pkg/isaac-sim-*/python.sh multi_robot_oiling.py
+isaac_python multi_robot_oiling.py
 ```
 
 Isaac Sim 설치 경로가 다른 경우, 본인 환경에 맞게 `python.sh` 경로를 수정합니다.
